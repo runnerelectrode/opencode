@@ -1,0 +1,73 @@
+name: Mint test
+
+# One-off: first live mint from the Cloudflare token issuer. Delete after it has run.
+on:
+  push:
+    branches: [mint-test]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  mint:
+    runs-on: ubuntu-latest
+    environment: release # must match the stage in config.ts
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: arn:aws:iam::604439173067:role/github/opencode-release
+          aws-region: us-east-1
+      - name: Cloudflare token
+        id: cloudflare-token
+        env:
+          CLOUDFLARE_TOKEN_URL: ${{ vars.CLOUDFLARE_TOKEN_URL }}
+          CLOUDFLARE_ACCOUNT_ID: "15d29c8639fd3733b1b5486a2acfd968"
+        run: |
+          set -euo pipefail
+          set +x
+          url="${CLOUDFLARE_TOKEN_URL:-https://kjivkui2evldapbok5fhrrl6oy0fctkp.lambda-url.us-east-1.on.aws/}"
+          url_pattern='^https://[a-z0-9]+\.lambda-url\.us-east-1\.on\.aws/$'
+          if ! [[ "$url" =~ $url_pattern ]]; then echo "::error::CLOUDFLARE_TOKEN_URL is not the token issuer's function URL"; exit 1; fi
+          case "$CLOUDFLARE_ACCOUNT_ID" in *[!0-9a-f]*|"") echo "::error::bad account id"; exit 1 ;; esac
+          if [ ${#CLOUDFLARE_ACCOUNT_ID} -ne 32 ]; then echo "::error::bad account id"; exit 1; fi
+          for name in AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; do
+            [ -n "${!name:-}" ] || { echo "::error::$name is not set"; exit 1; }
+          done
+          response=$(printf 'user = "%s:%s"\nheader = "x-amz-security-token: %s"\n' \
+            "$AWS_ACCESS_KEY_ID" "$AWS_SECRET_ACCESS_KEY" "$AWS_SESSION_TOKEN" |
+            curl --config - --proto '=https' --proto-redir '=https' \
+              --aws-sigv4 "aws:amz:us-east-1:lambda" --request POST --url "$url" \
+              --fail-with-body --silent --show-error --max-time 20)
+          token=$(printf '%s' "$response" | jq -er 'if (.token|type)=="string" then .token else error("token") end' 2>/dev/null)
+          expires=$(printf '%s' "$response" | jq -er 'if (.expires_on|type)=="string" then .expires_on else error("expires_on") end' 2>/dev/null)
+          case "$token" in ""|*[[:space:]]*) echo "::error::invalid token"; exit 1 ;; esac
+          if [ ${#token} -lt 8 ] || [ ${#token} -gt 512 ]; then echo "::error::invalid token length"; exit 1; fi
+          case "$expires" in ""|*[[:space:]]*) echo "::error::invalid expires_on"; exit 1 ;; esac
+          iso_pattern='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\.[0-9]+)?Z$'
+          if ! printf '%s' "$response" | jq -e --arg re "$iso_pattern" '(.expires_on | type) == "string" and (.expires_on | test($re))' > /dev/null; then
+            echo "::error::invalid expires_on"; exit 1
+          fi
+          if ! [[ "$expires" =~ $iso_pattern ]]; then
+            echo "::error::invalid expires_on"; exit 1
+          fi
+          printf '::add-mask::%s\n' "$token"
+          if [ -n "${GITHUB_OUTPUT:-}" ]; then
+            printf 'token=%s\nexpires_on=%s\n' "$token" "$expires" >> "$GITHUB_OUTPUT"
+          elif [ -n "${GITHUB_ENV:-}" ]; then
+            printf 'CLOUDFLARE_API_TOKEN=%s\n' "$token" >> "$GITHUB_ENV"
+          fi
+          if [ "${CLOUDFLARE_TOKEN_EXPORT:-step}" = "environment" ] && [ -n "${GITHUB_ENV:-}" ]; then
+            printf 'CLOUDFLARE_API_TOKEN=%s\n' "$token" >> "$GITHUB_ENV"
+          fi
+          export CLOUDFLARE_API_TOKEN="$token"
+          verify_url="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/tokens/verify"
+          if ! verify=$(printf 'header = "Authorization: Bearer %s"\nurl = "%s"\n' "$token" "$verify_url" |
+            curl --config - --proto '=https' --proto-redir '=https' --silent --show-error --fail-with-body --max-time 20); then
+            echo "::error::Cloudflare rejected the freshly minted token. The runner's egress IP may differ from the IP Lambda saw (IPv4 vs IPv6 or a different NAT address)." >&2
+            exit 1
+          fi
+          printf '%s' "$verify" | jq -e '.success == true and .result.status == "active"' > /dev/null
+          printf "%s" "$verify" | jq -r "\"token id: \" + .result.id"
+          echo "token verified active; expires $expires"
